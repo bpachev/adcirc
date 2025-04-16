@@ -4825,6 +4825,7 @@ C
       REAL(8) :: mperdeg
 
       LOGICAL, SAVE :: FIRSTCALL = .True.
+      INTEGER, SAVE :: NUMTRACKS = 1
 
       call setMessageSource("hollandget")
 #if defined(WIND_TRACE) || defined(ALL_TRACE)
@@ -4835,8 +4836,14 @@ C
       mperdeg  = Rearth * pi / 180.0d0
       omega = 2.0d0*pi / 86164.2d0
 C
+      CALL allMessage(INFO, 'Calling HollandGet')
       IF (FIRSTCALL) THEN
+         CALL CheckHollandMulti(NUMTRACKS)
          FIRSTCALL = .False.
+         IF (NUMTRACKS.gt.1) THEN
+             CALL HollandGetMulti(WVNX,WVNY,PRESS,TIMELOC,NUMTRACKS)
+             return
+         ENDIF
          ALLOCATE (RAD(NP),DX(NP),DY(NP),XCOOR(NP),YCOOR(NP))
          ALLOCATE (V_r(NP),THETA(NP))
 C
@@ -4845,6 +4852,11 @@ C     The subroutine only works for ICS=2 (spherical coordinates)
             XCOOR(I)=SLAM(I)*RAD2DEG
             YCOOR(I)=SFEA(I)*RAD2DEG
          END DO
+      ENDIF
+
+      IF (NUMTRACKS.gt.1) THEN
+          CALL HollandGetMulti(WVNX,WVNY,PRESS,TIMELOC,NUMTRACKS)
+          return
       ENDIF
 C
 C     Get data for this time step.
@@ -5009,7 +5021,7 @@ C     ----------------------------------------------------------------
 C
       SUBROUTINE GetHollandStormData(LatOut,LonOut,CPressOut,SpdOut,
      &     RRPOut,RMWOut,TVXOut,TVYOut,TIMELOC)
-      USE SIZES, ONLY : MyProc, GBLINPUTDIR
+      USE SIZES, ONLY : MyProc, GBLINPUTDIR, INPUTDIR
       USE GLOBAL, ONLY : RNDAY
       USE VORTEX, ONLY : uvtrans
       IMPLICIT NONE
@@ -5358,6 +5370,644 @@ C     ----------------------------------------------------------
       RETURN
 C     ----------------------------------------------------------------
       END SUBROUTINE GetHollandStormData
+C     ----------------------------------------------------------------
+
+C     ----------------------------------------------------------------
+C      S U B R O U T I N E  C H E C K  H O L L A N D  M U L T I
+C     ----------------------------------------------------------------
+C
+C     Checks to see if we should read one track or multiple tracks 
+C     in the NWS8 format
+C 
+C     ----------------------------------------------------------------
+
+      SUBROUTINE CheckHollandMulti(NUMTRACKS)
+      USE SIZES, ONLY : MyProc, GBLINPUTDIR, INPUTDIR
+      IMPLICIT NONE
+      INTEGER,intent(out) :: NUMTRACKS
+      INTEGER :: nl, ios
+
+      nl=0
+      call openFileForRead(22,TRIM(GBLINPUTDIR)//'/'//'fort.22',ios)
+      if ( ios.gt.0 ) then
+        call allMessage(ERROR,
+     &       "The symmetric vortex parameter file was not found. "
+     &       //"ADCIRC terminating.")
+        call windTerminate()
+      endif
+
+      DO
+        READ(UNIT=22,FMT='(A170)',END=8889)
+        nl=nl+1
+      ENDDO
+ 8889 REWIND(22)
+      IF (nl.lt.2) THEN
+        READ(22, *) NUMTRACKS
+        write(scratchMessage,'(a,i2)') "Multi-track fort22, ntracks: ",NUMTRACKS
+        call allMessage(INFO, scratchMessage)
+      ELSE
+        NUMTRACKS = 1
+      ENDIF
+      CLOSE(22)      
+
+      END SUBROUTINE CheckHollandMulti
+
+C     ----------------------------------------------------------------
+C      S U B R O U T I N E   H O L L A N D  G E T  M U L T I
+C     ----------------------------------------------------------------
+C
+C     Subroutine to calculate wind velocity at nodes from
+C     the Holland Wind model with multiple tracks.
+C
+C     ----------------------------------------------------------------
+      SUBROUTINE HollandGetMulti(WVNX,WVNY,PRESS,TIMELOC,NUMTRACKS)
+      USE SIZES, ONLY : MyProc, LOCALDIR
+      USE MESH, ONLY : X, Y, SLAM, SFEA, NP, ICS
+      USE GLOBAL, ONLY : RHOWAT0, G, mb2pa
+      IMPLICIT NONE
+      REAL(SZ), intent(in) :: TIMELOC
+      REAL(SZ), intent(out), dimension(NP) :: WVNX,WVNY
+      REAL(SZ), intent(out), dimension(NP) :: PRESS
+      INTEGER, intent(in) :: NUMTRACKS
+      INTEGER I, J, K
+      REAL(SZ) :: RAD,DX,DY
+      REAL(SZ),SAVE,ALLOCATABLE :: XCOOR(:),YCOOR(:) !lat and lon of nodes
+      REAL(SZ) :: V_r            !wind sp. as fn. of dist
+      REAL(SZ) :: THETA,WTRATIO
+      REAL(SZ),SAVE,ALLOCATABLE :: B(:)
+      REAL(SZ) :: TransSpdX, TransSpdY
+      REAL(SZ),SAVE,ALLOCATABLE :: cpress(:), lon(:), lat(:), spd(:)
+      REAL(SZ),SAVE,ALLOCATABLE :: TVX(:), TVY(:), RRP(:), RMW(:)
+      REAL(SZ),SAVE,ALLOCATABLE :: ts(:)        ! storm translation speed, m/s
+      REAL(SZ) :: WindMultiplier         ! for storm 2 in LPFS ensemble
+      REAL(SZ),SAVE,ALLOCATABLE :: centralPressureDeficit(:) ! difference btw ambient and cpress
+C
+      REAL(8) :: omega, coriolis
+      REAL(8) :: mperdeg
+
+      LOGICAL, SAVE :: FIRSTCALL = .True.
+
+      call setMessageSource("hollandgetmulti")
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+      call allMessage(DEBUG,"Enter.")
+#endif
+
+C
+      mperdeg  = Rearth * pi / 180.0d0
+      omega = 2.0d0*pi / 86164.2d0
+C
+      IF (FIRSTCALL) THEN
+         FIRSTCALL = .False.
+         ALLOCATE (XCOOR(NP),YCOOR(NP))
+         ALLOCATE (cpress(NUMTRACKS),lon(NUMTRACKS),lat(NUMTRACKS),
+     &             spd(NUMTRACKS),TVX(NUMTRACKS),TVY(NUMTRACKS),
+     &             RRP(NUMTRACKS),RMW(NUMTRACKS),ts(NUMTRACKS))
+         ALLOCATE (B(NUMTRACKS),centralPressureDeficit(NUMTRACKS))
+C
+C     The subroutine only works for ICS=2 (spherical coordinates)
+         DO I=1,NP
+            XCOOR(I)=SLAM(I)*RAD2DEG
+            YCOOR(I)=SFEA(I)*RAD2DEG
+         END DO
+      ENDIF
+
+      call allMessage(INFO, "Made it to hollandgetmulti")    
+C
+C     Get data for this time step.
+      CALL GetHollandStormDataMulti(lat,lon,cpress,spd,rrp,rmw,
+     &                         tvx,tvy,TIMELOC, NUMTRACKS)
+      
+      ! @jasonfleming: If this is a "CALM" period, set winds to zero
+      ! velocity and pressure equal to the background pressure and return.
+C      if ( cpress.lt.0.d0 ) then
+C         press(:) = PRBCKGRND * mb2pa / rhoWat0g ! convert mb to mH2O
+C         wvnx(:)=0.d0
+C         wvny(:)=0.d0
+C         EyeLat(1) = EyeLat(2)
+C         EyeLon(1) = EyeLon(2)
+C         EyeLat(2) = EyeLat(3)
+C         EyeLon(2) = EyeLon(3)
+C         EyeLat(3) = lat
+C         EyeLon(3) = lon
+C         FoundEye = .true.
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+C         call allMessage(DEBUG,"Return.")
+#endif
+C         call unsetMessageSource()
+C         return
+C      endif
+C
+C     jgf50.32: If we are using sector-based wind drag, record the location
+C     of the center of the storm.
+C      IF ((lat.ne.EyeLat(3)).or.(lon.ne.EyeLon(3))) THEN
+C         EyeLat(1) = EyeLat(2)
+C         EyeLon(1) = EyeLon(2)
+C         EyeLat(2) = EyeLat(3)
+C         EyeLon(2) = EyeLon(3)
+C         EyeLat(3) = lat
+C         EyeLon(3) = lon
+C         FoundEye = .true.
+C      ENDIF
+C
+C     Calculate and limit central pressure deficit; some track files
+C     (e.g., Charley 2004) may have a central pressure greater than the
+C     ambient pressure that this subroutine assumes
+
+C     jgf51.14: Apply a factor of 100.0 to convert PRBCKGRND from
+C     mb to pa for use in this subroutine.
+      DO K=1,NUMTRACKS
+      centralPressureDeficit(K) = PRBCKGRND * 100.d0 - cpress(K)
+      IF ( centralPressureDeficit(K) .lt. 100.d0 ) THEN
+         centralPressureDeficit(K) = 100.d0
+      ENDIF
+C
+C     jgf46.29 Subtract the translational speed of the storm from the
+C     observed max wind speed to avoid distortion in the Holland curve
+C     fit. The translational speed will be added back later.
+      ts(K)=sqrt(tvx(K)*tvx(K)+tvy(K)*tvy(K))
+      spd(K)=spd(K)-ts(K)
+C
+C     Convert wind speed from 10 meter altitude (which is what the
+C     NHC forecast contains) to wind speed at the top of the atmospheric
+C     boundary layer (which is what the Holland curve fit requires).
+      spd(K)=spd(K)/BLAdj
+C
+C     Calculate Holland parameters and limit the result to its appropriate
+C     range.
+      B(K) = rhoAir*e*(spd(K)**2.d0)/(centralPressureDeficit(K))
+      IF (B(K).lt.1.0d0) B(K)=1.0d0
+      IF (B(K).gt.2.5d0) B(K)=2.5d0
+C
+#ifdef DEBUG_HOLLAND
+      WRITE(16,4321) B(K)
+ 4321 FORMAT(/,2x,'Holland B parameter is ',e16.8)
+#endif
+      END DO
+C
+C     Calculate wind velocity and pressure at each node.
+      DO I=1,NP
+      wvnx(I)=0
+      wvny(I)=0
+      PRESS(I)=PRBCKGRND * mb2pa / rhoWat0g
+      DO K=1,NUMTRACKS
+         DX=(XCOOR(I)-lon(K))*DEG2RAD
+         DY=(YCOOR(I)-lat(K))*DEG2RAD
+         rad = sphericalDistance(DX,DY,lat(K), ycoor(i))
+         THETA=ATAN2(DY,DX)
+C     RJW v48.45
+C     Compute the distances based on haversine formula for distance along a sphere
+C         rad(i) = sphericalDistance(DX(I),DY(I),lat, ycoor(i))
+C     Compute coriolis
+C         coriolis = 2.0d0 * omega * sin(YCOOR(I)*DEG2RAD)
+C     Compute pressure field
+C         PRESS(I)=(cpress+(centralPressureDeficit)*
+C     &        EXP(-(RMW*1000.d0/RAD(I))**B)) / (RHOWAT0*G)
+C     Compute velocity field with absolute around 
+C     CORIOLIS for the Southern Hempisphere
+C         V_r(I) = sqrt(
+C     &        (RMW*1000.d0/RAD(I))**B *
+C     &        EXP(1.d0-(RMW*1000.d0/RAD(I))**B)*spd**2.d0
+C     &        + (RAD(I)**2.d0)*(CORIOLIS**2.d0)/4.d0
+C     &        )
+C     &        - RAD(I)*ABS(CORIOLIS)/2.d0
+C
+C     jgf46.31 Determine translation speed that should be added to final
+C     storm wind speed. This is tapered to zero as the storm wind tapers
+C     to zero toward the eye of the storm and at long distances from the
+C     storm.
+C         TransSpdX = (abs(V_r(I))/spd)*TVX
+C         TransSpdY = (abs(V_r(I))/spd)*TVY
+C     Apply mutliplier for Storm2 in LPFS ensemble.
+C         V_r(I) = V_r(I) * WindMultiplier
+C
+C     Find the velocity components.
+C         WVNX(I)=-V_r(I)*SIN(THETA(I))
+C         WVNY(I)= V_r(I)*COS(THETA(I))
+C
+C     jgf46.19 Convert wind velocity from top of atmospheric boundary
+C     layer (which is what the Holland curve fit produces) to wind
+C     velocity at 10m above the earth's surface (factor of
+C     0.7).
+C         WVNX(I)=WVNX(I)*BLAdj
+C         WVNY(I)=WVNY(I)*BLAdj
+C
+C     jgf46.21 Also convert from 1 minute averaged winds to 10
+C     minute averaged winds (0.88 factor).
+C         WVNX(I)=WVNX(I)*one2ten
+C         WVNY(I)=WVNY(I)*one2ten
+C
+C     jgf46.31 Add the storm translation speed.
+C         WVNX(I)=WVNX(I)+TransSpdX
+C         WVNY(I)=WVNY(I)+TransSpdY
+C
+C     jgf46.31 Set the wind velocities to zero outside the last closed
+C     isobar.
+C         IF (RAD(I).gt.rrp) THEN
+C            WVNX(I)=0.0d0
+C            WVNY(I)=0.0d0
+C         ENDIF
+C
+      END DO ! k loop
+      END DO ! i loop
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+      call allMessage(DEBUG,"Return.")
+#endif
+      call unsetMessageSource()
+C     ----------------------------------------------------------------
+
+      END SUBROUTINE HollandGetMulti
+C     ----------------------------------------------------------------
+
+C     ----------------------------------------------------------------
+C      S U B R O U T I N E   G E T  H O L L A N D  S T O R M  D A T A 
+C      M U L T I
+C     ----------------------------------------------------------------
+C      Read data from multiple NWS8-style track files
+C     ----------------------------------------------------------------
+
+      SUBROUTINE GetHollandStormDataMulti(LatOut,LonOut,CPressOut,
+     &     SpdOut,RRPOut,RMWOut,TVXOut,TVYOut,TIMELOC, NUMTRACKS)
+      USE SIZES, ONLY : MyProc, GBLINPUTDIR, INPUTDIR
+      USE GLOBAL, ONLY : RNDAY
+      USE VORTEX, ONLY : uvtrans
+      IMPLICIT NONE
+      REAL(SZ),intent(in) :: TIMELOC
+      REAL(SZ),intent(out),dimension(:) :: LatOut, LonOut, CPressOut
+      REAL(SZ),intent(out),dimension(:) :: SpdOut,RRPOut,RMWOut
+      REAL(SZ),intent(out),dimension(:) :: TVXOut, TVYOut
+      INTEGER,intent(in) :: NUMTRACKS
+C
+      INTEGER, ALLOCATABLE, SAVE :: iYear(:,:),iMth(:,:)
+      INTEGER, ALLOCATABLE, SAVE :: iDay(:,:),iHr(:,:)
+      INTEGER, ALLOCATABLE, SAVE :: iLat(:,:),iLon(:,:)
+      CHARACTER(1), ALLOCATABLE, SAVE :: ns(:,:), ew(:,:)
+      INTEGER, ALLOCATABLE, SAVE :: iSpd(:,:),iCPress(:,:)
+      INTEGER, ALLOCATABLE, SAVE :: iRRP(:,:),iRMW(:,:)
+      REAL(SZ), ALLOCATABLE, SAVE :: Lat(:,:),Lon(:,:),Spd(:,:)
+      REAL(SZ), ALLOCATABLE, SAVE :: CPress(:,:),RRP(:,:),RMW(:,:)
+      REAL(SZ), ALLOCATABLE, SAVE :: TVX(:,:), TVY(:,:)      ! jgf46.32jgf9
+      CHARACTER(len=4), ALLOCATABLE, SAVE :: CastType(:,:) !hindcast,forecast
+      INTEGER, ALLOCATABLE, SAVE :: iFcstInc(:,:) ! hours
+      REAL(SZ), ALLOCATABLE, SAVE :: FcstInc(:,:) ! seconds
+      REAL(SZ),SAVE :: WTRATIO          !time ratio used for interpolation
+      REAL(8), ALLOCATABLE, SAVE :: CastTime(:,:) ! seconds since start of year
+      LOGICAL,SAVE :: FIRSTCALL = .True.
+      INTEGER,ALLOCATABLE,SAVE :: i_list(:)  ! Current array counters for fort.22 files
+      INTEGER,ALLOCATABLE,SAVE :: nl_list(:) ! Number of lines in the fort.22 files
+      INTEGER,ALLOCATABLE,SAVE :: pl(:) ! populated lengths of Holland Data array
+      INTEGER,ALLOCATABLE,SAVE :: nl ! max nl across all fort.22 files
+      INTEGER :: i,j,k ! loop counters
+      INTEGER :: ios ! return code for an i/o operation
+      CHARACTER(3) :: kStr ! string version of k
+      call setMessageSource("getHollandStormDataMulti")
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+      call allMessage(DEBUG,"Enter.")
+#endif
+
+C     ------------------------------------------------------
+C     BEGIN Code executed upon first call to this subroutine
+C     ------------------------------------------------------
+      IF (FIRSTCALL) THEN
+C
+C     Determine the number of lines in each file.
+         ALLOCATE(nl_list(NUMTRACKS),pl(NUMTRACKS),i_list(NUMTRACKS))
+         DO k=1,NUMTRACKS
+             nl_list(k)=0
+             write(kStr,'(i0)') k
+             call openFileForRead(22,
+     &        TRIM(GBLINPUTDIR)//'/'//'fort.22.'//TRIM(kStr),ios)
+             if ( ios.gt.0 ) then
+                call allMessage(ERROR,
+     &           "The symmetric vortex parameter file was not found. "
+     &           //"ADCIRC terminating.")
+                call windTerminate()
+             endif
+
+             DO
+                READ(UNIT=22,FMT='(A170)',END=8888)
+                nl_list(k)=nl_list(k)+1
+             ENDDO
+ 8888        CLOSE(22)
+         END DO
+         nl = maxval(nl_list)
+C
+C     Dimension the arrays according to the number of lines in the file,
+C     this will be greater than or equal to the size of the array we need
+C     (probably greater because of the repeated lines that we throw away)
+         ALLOCATE(iYear(NUMTRACKS,nl),iMth(NUMTRACKS,nl),
+     &        iDay(NUMTRACKS,nl),iHr(NUMTRACKS,nl),iLat(NUMTRACKS,nl),
+     &        iLon(NUMTRACKS,nl),iSpd(NUMTRACKS,nl),
+     &        iCpress(NUMTRACKS,nl),iRRP(NUMTRACKS,nl),
+     &        iRMW(NUMTRACKS,nl),iFcstInc(NUMTRACKS,nl))
+         ALLOCATE(ns(NUMTRACKS,nl),ew(NUMTRACKS,nl))
+         ALLOCATE(Lat(NUMTRACKS,nl),Lon(NUMTRACKS,nl),Spd(NUMTRACKS,nl),
+     &        CPress(NUMTRACKS,nl),RRP(NUMTRACKS,nl),RMW(NUMTRACKS,nl),
+     &        FcstInc(NUMTRACKS,nl),TVX(NUMTRACKS,nl),TVY(NUMTRACKS,nl))
+         ALLOCATE(CastType(NUMTRACKS,nl))
+         ALLOCATE(CastTime(NUMTRACKS,nl))
+
+         ! initialize storm translation speeds
+         ! this needs to be done only once before k loop
+         TVX = 0.0
+         TVY = 0.0
+
+C
+C     Now read the data into the arrays. The first
+C     line must be a hindcast/nowcast.
+         DO k=1,NUMTRACKS
+            i=1
+            write(kStr,'(i0)') k
+            call openFileForRead(22,
+     &        TRIM(GBLINPUTDIR)//'/'//'fort.22.'//TRIM(kStr),ios)
+            if ( ios.gt.0 ) then
+                call allMessage(ERROR,
+     &           "The symmetric vortex parameter file was not found. "
+     &           //"ADCIRC terminating.")
+                call windTerminate()
+            endif
+            DO
+C     Get another line of data from the file and check to see if the
+C     line represents a new point in time, or is a repeated time
+C     point. Repeated time points occur in hindcasts for the purpose of
+C     describing winds in the quadrants of the storm. We don't use the
+C     quadrant-by-quadrant wind data. Repeated time data occur in the
+C     forecast because the time data is just the time that the forecast
+C     was made. The important parameter in the forecast file is the
+C     forecast increment.
+               READ(UNIT=22,FMT=228,END=9999)
+     &           iYear(k,i),iMth(k,i),iDay(k,i),iHr(k,i),
+     &           CastType(k,i),iFcstInc(k,i),iLat(k,i),ns(k,i),
+     &           iLon(k,i),ew(k,i),
+     &           iSpd(k,i),iCPress(k,i),iRRP(k,i),iRMW(k,i)
+
+C                yr,mo,dy,hr, ,type, inc,  lat,NS,  lon,EW,  spd,   pc,
+ 228    format(8x,i4,i2,i2,i2,6x,a4,2x,i3,1x,i4,a1,2x,i4,a1,2x,i3,2x,i4,
+     &     47x,i3,2x,i3)
+C              RRP,  RMW
+
+C
+C
+               SELECT CASE(trim(CastType(k,i)))
+C           ------------
+               CASE("BEST")     ! nowcast/hindcast
+C           ------------
+C     Check to see if this is a repeated line. If so, go directly to the
+C     next line without any processing.
+                  IF (i.gt.1) THEN
+                  IF ( iYear(k,i).eq.iYear(k,i-1).and.iMth(k,i).eq.
+     &              iMth(k,i-1).and.iDay(k,i).eq.iDay(k,i-1)
+     &              .and.iHr(k,i).eq.iHr(k,i-1)) THEN
+                     CYCLE
+                  ENDIF
+                  ENDIF
+C
+C     Determine the time of this hindcast in seconds since the beginning
+C     of the year.
+                  CALL allMessage(INFO, scratchMessage)
+                  CALL TimeConv(iYear(k,i),iMth(k,i),iDay(k,i),
+     &              iHr(k,i),0,0.d0,CastTime(k,i))
+C
+C     Determine the CastTime in seconds since the beginning of the simulation.
+                  CastTime(k,i)=CastTime(k,i)-WindRefTime
+                  FcstInc(k,i)=iFcstInc(k,i)
+C
+C              ------------
+               CASE("OFCL")        ! forecast
+C              ------------
+C     Check to see if this is a repeated line (i.e., a forecast that
+C     coincides with the nowcast, or a repeated forecast). If so, go
+C     directly to the next line without any processing.
+                  IF (i.gt.1 ) THEN
+                  IF ((iFcstInc(k,i).eq.0.and.
+     &              (iYear(k,i).eq.iYear(k,i-1)
+     &              .and.iMth(k,i).eq.iMth(k,i-1)
+     &              .and.iDay(k,i).eq.iDay(k,i-1)
+     &              .and.iHr(k,i).eq.iHr(k,i-1)))
+     &              .or.
+     &             (iFcstInc(k,i).ne.0.and.
+     &             iFcstInc(k,i).eq.iFcstInc(k,i-1)))
+     &                 THEN
+                     CYCLE
+                  ENDIF
+                  ENDIF
+                  FcstInc(k,i) = iFcstInc(k,i)
+C
+C     Determine the time of this forecast in seconds since the beginning
+C     of the year.
+                  IF ( iFcstInc(k,i).eq.0 ) THEN
+                     CALL TimeConv(iYear(k,i),iMth(k,i),iDay(k,i),
+     &                 iHr(k,i),0,0.d0,CastTime(k,i))
+                     CastTime(k,i)=CastTime(k,i)-WindRefTime
+                  ELSE
+                     FcstInc(k,i) = FcstInc(k,i) * 3600.d0 ! convert hours to seconds
+                     CastTime(k,i) = CastTime(k,i-1) +
+     &                 ( FcstInc(k,i) - FcstInc(k,i-1) )
+                  ENDIF
+C
+C     jgf48.4637 If the forecast values of central pressure or RMW are
+C     zero (and they will be if unless the user has filled them in, because
+C     the NHC does not forecast these parameters), exit with a fatal error.
+                  IF ( (iCPress(k,i).eq.0).or.(iRMW(k,i).eq.0) ) THEN
+                     call allMessage(ERROR,
+     &            'The storm hindcast/forecast input file (unit 22) '//
+     &            'contains invalid data for central pressure or Rmax.')
+                     call windTerminate()
+                  endif
+C
+      ! @jasonfleming: Adding a new type to allow the analyst to add lines
+      ! that do nothing but produce zero winds and background barometric
+      ! pressure. These lines can have a date/time like a BEST line or
+      ! a date/time and forecast period like an OFCL line.
+               CASE("CALM")
+                  call allMessage(ECHO,
+     &            'The fort.22 file contains at least one "CALM" line.')
+                  IF (i.gt.1 ) THEN
+                     IF ((iFcstInc(k,i).eq.0.and.
+     &              (iYear(k,i).eq.iYear(k,i-1)
+     &              .and.iMth(k,i).eq.iMth(k,i-1)
+     &              .and.iDay(k,i).eq.iDay(k,i-1)
+     &              .and.iHr(k,i).eq.iHr(k,i-1)))
+     &              .or.
+     &              (iFcstInc(k,i).ne.0.and.
+     &              iFcstInc(k,i).eq.iFcstInc(k,i-1)))
+     &                 THEN
+                     CYCLE
+                  ENDIF
+                  ENDIF
+                  FcstInc(k,i) = iFcstInc(k,i)
+
+                  IF ( iFcstInc(k,i).eq.0 ) THEN
+                     CALL TimeConv(iYear(k,i),iMth(k,i),iDay(k,i),
+     &                 iHr(k,i),0,0.d0,CastTime(k,i))
+                     CastTime(k,i)=CastTime(k,i)-WindRefTime
+                  ELSE
+                     FcstInc(k,i) = FcstInc(k,i) * 3600.d0 ! convert hours to seconds
+                     CastTime(k,i) = CastTime(k,i-1) +
+     &                 ( FcstInc(k,i) - FcstInc(k,i-1) )
+                  ENDIF
+
+               CASE DEFAULT        ! unrecognized
+                  call allMessage(ERROR,
+     &          'Only "BEST", "OFCL", or "CALM" are allowed '//
+     &          'in the 5th column of fort.22.')
+                  call windTerminate()
+               END SELECT
+C
+C     Convert integers to reals.
+               Lat(k,i) = iLat(k,i)
+               Lon(k,i) = iLon(k,i)
+               Spd(k,i) = iSpd(k,i)
+               CPress(k,i) = iCPress(k,i)
+               RRP(k,i) = iRRP(k,i)
+               RMW(k,i) = iRMW(k,i)
+C
+C     Convert units.
+               Lat(k,i) = Lat(k,i) / 10.d0 ! convert 10ths of degs to degs
+               Lon(k,i) = Lon(k,i) / 10.d0 ! convert 10ths of degs to degs
+               if ( ew(k,i).eq.'W' ) then
+                  Lon(k,i) = -1.d0 * Lon(k,i) ! negative b/c WEST longitude
+               endif
+               if ( ns(k,i).eq.'S' ) then
+                  Lat(k,i) = -1.d0 * Lat(k,i) ! negative b/c SOUTH latitude
+               endif
+               CPress(k,i) = CPress(k,i) * 100.d0 ! convert mbar to Pa
+               RRP(k,i) = RRP(k,i) * 1.852000003180799d0 * 1000.0d0 ! convert nm to m
+               RMW(k,i) = RMW(k,i) * 1.852000003180799d0 ! convert nm to km
+               Spd(k,i) = Spd(k,i) * 0.51444444d0 ! convert kts to m/s
+C
+#ifdef DEBUG_HOLLAND
+               WRITE(16,1244) CastTime(k,i),Lat(k,i),Lon(k,i),
+     &           Spd(k,i),CPress(k,i),RRP(k,i),RMW(k,i),WindRefTime
+               if ( i.gt.1 ) then
+                  write(scratchMessage,2355) FcstInc(k,i-1)
+                  call logMessage(DEBUG, scratchMessage)
+               endif
+ 1244          FORMAT('DEBUG HOLLAND: CastTime ',
+     &           e16.8,' Lat ',f6.2,' Lon ',f6.2,
+     &           /,'Spd ',f8.2,' CPress ',f10.2,' RRP ',f12.2,
+     &           ' RMW ',f8.2, ' WindRefTime ',e16.8)
+ 2355          format('FcstInc(k,i-1) ',e16.8)
+#endif
+C
+C     Save the number of non-repeated lines from the fort.22 file, this
+C     is the populated length of the array.
+               pl(k)=i
+C
+C     Increment array counter
+               i=i+1
+C
+            ENDDO
+ 9999       CLOSE(22)
+C
+C     Calculate storm translation velocities based on change in position, then
+C     convert degrees/time to m/s
+            DO i=2, pl(k)
+C     Calculate storm translation velocities based on change in position,
+            ! approximate u and v translation velocities
+               call uvTrans(lat(k,i-1),lon(k,i-1),
+     &                    lat(k,i),lon(k,i),
+     &                    CastTime(k,i-1),CastTime(k,i),
+     &                    tvx(k,i),tvy(k,i))
+
+            ENDDO
+         ! extrapolate later storm translation speeds back to the
+         ! first storm position
+            IF ( pl(k).ge.2 ) THEN
+               TVX(k,1) = TVX(k,2)
+               TVY(k,1) = TVY(k,2)
+            ENDIF
+C
+C     Determine the correspondence between the current simulation time and
+C     the fort.22 file.
+            i=2
+            DO
+               IF (ceiling(TIMELOC).ge.CastTime(k,i-1).and.
+     &             floor(TIMELOC).lt.CastTime(k,i)) THEN
+                  EXIT
+               ELSE
+                  i=i+1
+                  IF (i.gt.pl(k)) THEN
+                     call allMessage(ERROR,
+     &             "The Storm Hindcast/Forecast Input File (unit 22) "
+     &             //"does not contain times/dates that correspond "
+     &             //"to the ADCIRC current model time. "
+     &             //" ADCIRC terminating.")
+                  call windTerminate()
+                  ENDIF
+               ENDIF
+            ENDDO
+            i_list(k) = i ! save i
+            IF (CastTime(k,pl(k)).lt.RNDAY*86400.d0) THEN
+               call allMessage(ERROR,'multi fort.22 ends before RNDAY.')
+               call windTerminate()
+            ENDIF
+         ENDDO ! end loop over tracks
+         FIRSTCALL = .False.
+      ENDIF
+
+C     ----------------------------------------------------------
+C     END Code executed only upon first call to this subroutine
+C     ----------------------------------------------------------
+C
+C
+C     ----------------------------------------------------------
+C     BEGIN Code executed on every call to this subroutine
+C     ----------------------------------------------------------
+C
+C     If time exceeds the next hindcast/nowcast/forecast time, increment the
+C     array counter.
+      DO k=1,NUMTRACKS
+      i = i_list(k)
+      IF (TIMELOC.gt.CastTime(k,i)) THEN
+         i=i+1
+C        jgf51.14: Check to see that we haven't gone off the end of
+C        meteorological data.
+          IF (i.gt.pl(k)) THEN
+             call allMessage(ERROR,'The simulation time has extended '//
+     &          'beyond the end of the meteorological dataset.')
+             call windTerminate()
+          ENDIF
+      ENDIF
+      i_list(k) = i ! save any updates in i
+C
+C     Interpolate w.r.t. time
+      ! @jasonfleming: Add CALM handling.
+      LonOut = Lon(k,i-1) + WTRATIO*(Lon(k,i)-lon(k,i-1))
+      LatOut = Lat(k,i-1) + WTRATIO*(Lat(k,i)-lat(k,i-1))
+      if ( (trim(castType(k,i)).ne.'CALM').and.
+     &      trim(castType(k,i-1)).ne.'CALM' ) then
+      WTRATIO=(TIMELOC-CastTime(k,i-1))/(CastTime(k,i)-CastTime(k,i-1))
+      CPressOut(k) = CPress(k,i-1) + WTRATIO*(CPress(k,i)-CPress(k,i-1))
+      SpdOut(k) = Spd(k,i-1) + WTRATIO*(Spd(k,i)-Spd(k,i-1))
+      RRPOut(k) = RRP(k,i-1) + WTRATIO*(RRP(k,i)-RRP(k,i-1))
+      RMWOut(k) = RMW(k,i-1) + WTRATIO*(RMW(k,i)-RMW(k,i-1))
+      TVXOut(k) = TVX(k,i-1) + WTRATIO*(TVX(k,i)-TVX(k,i-1))
+      TVYOut(k) = TVY(k,i-1) + WTRATIO*(TVY(k,i)-TVY(k,i-1))
+      else
+      CPressOut(k) = -99999.d0
+      SpdOut(k) = -99999.d0
+      RRPOut(k) = -99999.d0
+      RMWOut(k) = -99999.d0
+      TVXOut(k) = -99999.d0
+      TVYOut(k) = -99999.d0
+      endif
+C
+C     ----------------------------------------------------------
+C     END Code executed on every call to this subroutine
+C     ----------------------------------------------------------
+ 10   format(8x,i4,i2,i2,i2,6x,a4,7x,i3,4x,i3,3x,i3,2x,i4,52x,i3)
+ 12   format(8x,i4,i2,i2,i2,6x,a4,2x,i3,2x,i3,4x,i3,3x,i3,2x,i4,52x,i3)
+ 14   format(8x,i4,i2,i2,i2,6x,a4,2x,i3,1x,i4,3x,i4,3x,i3,2x,i4,47x,i3,
+     &     2x,i3)
+      END DO ! end k loop
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+      call allMessage(DEBUG,"Return.")
+#endif
+      call unsetMessageSource()
+
+      RETURN
+C     ----------------------------------------------------------------
+      END SUBROUTINE GetHollandStormDataMulti
 C     ----------------------------------------------------------------
 
 
