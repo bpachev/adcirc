@@ -4842,6 +4842,10 @@ C
          FIRSTCALL = .False.
          IF (NUMTRACKS.gt.1) THEN
              CALL HollandGetMulti(WVNX,WVNY,PRESS,TIMELOC,NUMTRACKS)
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+             call allMessage(DEBUG,"Return.")
+#endif
+             call unsetMessageSource()
              return
          ENDIF
          ALLOCATE (RAD(NP),DX(NP),DY(NP),XCOOR(NP),YCOOR(NP))
@@ -4856,6 +4860,10 @@ C     The subroutine only works for ICS=2 (spherical coordinates)
 
       IF (NUMTRACKS.gt.1) THEN
           CALL HollandGetMulti(WVNX,WVNY,PRESS,TIMELOC,NUMTRACKS)
+#if defined(WIND_TRACE) || defined(ALL_TRACE)
+          call allMessage(DEBUG,"Return.")
+#endif
+          call unsetMessageSource()
           return
       ENDIF
 C
@@ -5429,8 +5437,8 @@ C     ----------------------------------------------------------------
       REAL(SZ), intent(out), dimension(NP) :: WVNX,WVNY
       REAL(SZ), intent(out), dimension(NP) :: PRESS
       INTEGER, intent(in) :: NUMTRACKS
-      INTEGER I, J, K
-      REAL(SZ) :: RAD,DX,DY
+      INTEGER I, J, K, MINK
+      REAL(SZ) :: RAD,DX,DY,MINRAD
       REAL(SZ),SAVE,ALLOCATABLE :: XCOOR(:),YCOOR(:) !lat and lon of nodes
       REAL(SZ) :: V_r            !wind sp. as fn. of dist
       REAL(SZ) :: THETA,WTRATIO
@@ -5471,7 +5479,6 @@ C     The subroutine only works for ICS=2 (spherical coordinates)
          END DO
       ENDIF
 
-      call allMessage(INFO, "Made it to hollandgetmulti")    
 C
 C     Get data for this time step.
       CALL GetHollandStormDataMulti(lat,lon,cpress,spd,rrp,rmw,
@@ -5549,64 +5556,41 @@ C     Calculate wind velocity and pressure at each node.
       wvnx(I)=0
       wvny(I)=0
       PRESS(I)=PRBCKGRND * mb2pa / rhoWat0g
+      coriolis = 2.0d0 * omega * sin(YCOOR(I)*DEG2RAD)
+      ! cutoff of 1000km for storm radius is reasonable
+      MINRAD=1000000.d0
       DO K=1,NUMTRACKS
          DX=(XCOOR(I)-lon(K))*DEG2RAD
          DY=(YCOOR(I)-lat(K))*DEG2RAD
          rad = sphericalDistance(DX,DY,lat(K), ycoor(i))
+         IF (rad.ge.MINRAD) THEN ! no need to compute
+           CYCLE
+         ENDIF
+
          THETA=ATAN2(DY,DX)
-C     RJW v48.45
-C     Compute the distances based on haversine formula for distance along a sphere
-C         rad(i) = sphericalDistance(DX(I),DY(I),lat, ycoor(i))
-C     Compute coriolis
-C         coriolis = 2.0d0 * omega * sin(YCOOR(I)*DEG2RAD)
-C     Compute pressure field
-C         PRESS(I)=(cpress+(centralPressureDeficit)*
-C     &        EXP(-(RMW*1000.d0/RAD(I))**B)) / (RHOWAT0*G)
-C     Compute velocity field with absolute around 
-C     CORIOLIS for the Southern Hempisphere
-C         V_r(I) = sqrt(
-C     &        (RMW*1000.d0/RAD(I))**B *
-C     &        EXP(1.d0-(RMW*1000.d0/RAD(I))**B)*spd**2.d0
-C     &        + (RAD(I)**2.d0)*(CORIOLIS**2.d0)/4.d0
-C     &        )
-C     &        - RAD(I)*ABS(CORIOLIS)/2.d0
+         V_r = sqrt(
+     &        (RMW(K)*1000.d0/RAD)**B(K) *
+     &        EXP(1.d0-(RMW(K)*1000.d0/RAD)**B(K))*spd(K)**2.d0
+     &        + (RAD**2.d0)*(CORIOLIS**2.d0)/4.d0
+     &        )
+     &        - RAD*ABS(CORIOLIS)/2.d0
 C
 C     jgf46.31 Determine translation speed that should be added to final
 C     storm wind speed. This is tapered to zero as the storm wind tapers
 C     to zero toward the eye of the storm and at long distances from the
 C     storm.
-C         TransSpdX = (abs(V_r(I))/spd)*TVX
-C         TransSpdY = (abs(V_r(I))/spd)*TVY
-C     Apply mutliplier for Storm2 in LPFS ensemble.
-C         V_r(I) = V_r(I) * WindMultiplier
+         TransSpdX = (abs(V_r)/spd(K))*TVX(K)
+         TransSpdY = (abs(V_r)/spd(K))*TVY(K)
 C
-C     Find the velocity components.
-C         WVNX(I)=-V_r(I)*SIN(THETA(I))
-C         WVNY(I)= V_r(I)*COS(THETA(I))
-C
-C     jgf46.19 Convert wind velocity from top of atmospheric boundary
-C     layer (which is what the Holland curve fit produces) to wind
-C     velocity at 10m above the earth's surface (factor of
-C     0.7).
-C         WVNX(I)=WVNX(I)*BLAdj
-C         WVNY(I)=WVNY(I)*BLAdj
-C
-C     jgf46.21 Also convert from 1 minute averaged winds to 10
-C     minute averaged winds (0.88 factor).
-C         WVNX(I)=WVNX(I)*one2ten
-C         WVNY(I)=WVNY(I)*one2ten
-C
-C     jgf46.31 Add the storm translation speed.
-C         WVNX(I)=WVNX(I)+TransSpdX
-C         WVNY(I)=WVNY(I)+TransSpdY
-C
-C     jgf46.31 Set the wind velocities to zero outside the last closed
-C     isobar.
-C         IF (RAD(I).gt.rrp) THEN
-C            WVNX(I)=0.0d0
-C            WVNY(I)=0.0d0
-C         ENDIF
-C
+         ! only use the wind and pressure from the closest track
+         ! if more than two are within 1000km of the point
+         IF (rad.lt.MINRAD) THEN
+           MINRAD=rad
+           PRESS(I)=(cpress(k)+(centralPressureDeficit(k))*
+     &       EXP(-(RMW(K)*1000.d0/RAD)**B(K))) / (RHOWAT0*G)
+           WVNX(I)=-V_r*SIN(THETA)*BLAdj*one2ten+TransSpdX
+           WVNY(I)= V_r*COS(THETA)*BLAdj*one2ten+TransSpdY
+         ENDIF
       END DO ! k loop
       END DO ! i loop
 #if defined(WIND_TRACE) || defined(ALL_TRACE)
