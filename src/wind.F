@@ -4997,6 +4997,7 @@ C
 C     jgf46.31 Add the storm translation speed.
          WVNX(I)=WVNX(I)+TransSpdX
          WVNY(I)=WVNY(I)+TransSpdY
+
 C
 C     jgf46.31 Set the wind velocities to zero outside the last closed
 C     isobar.
@@ -5557,8 +5558,7 @@ C     Calculate wind velocity and pressure at each node.
       wvny(I)=0
       PRESS(I)=PRBCKGRND * mb2pa / rhoWat0g
       coriolis = 2.0d0 * omega * sin(YCOOR(I)*DEG2RAD)
-      ! cutoff of 1000km for storm radius is reasonable
-      MINRAD=1000000.d0
+      MINRAD=1000000000.d0
       DO K=1,NUMTRACKS
          DX=(XCOOR(I)-lon(K))*DEG2RAD
          DY=(YCOOR(I)-lat(K))*DEG2RAD
@@ -5956,11 +5956,11 @@ C        meteorological data.
 C
 C     Interpolate w.r.t. time
       ! @jasonfleming: Add CALM handling.
-      LonOut = Lon(k,i-1) + WTRATIO*(Lon(k,i)-lon(k,i-1))
-      LatOut = Lat(k,i-1) + WTRATIO*(Lat(k,i)-lat(k,i-1))
       if ( (trim(castType(k,i)).ne.'CALM').and.
      &      trim(castType(k,i-1)).ne.'CALM' ) then
       WTRATIO=(TIMELOC-CastTime(k,i-1))/(CastTime(k,i)-CastTime(k,i-1))
+      LonOut(k) = Lon(k,i-1) + WTRATIO*(Lon(k,i)-lon(k,i-1))
+      LatOut(k) = Lat(k,i-1) + WTRATIO*(Lat(k,i)-lat(k,i-1))
       CPressOut(k) = CPress(k,i-1) + WTRATIO*(CPress(k,i)-CPress(k,i-1))
       SpdOut(k) = Spd(k,i-1) + WTRATIO*(Spd(k,i)-Spd(k,i-1))
       RRPOut(k) = RRP(k,i-1) + WTRATIO*(RRP(k,i)-RRP(k,i-1))
